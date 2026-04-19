@@ -45,6 +45,8 @@ go build -o tlink .
 
 ### 局域网传输
 
+> 在termux中运行tlink之后无法执行termux命令，这是shellexec导致的兼容问题！
+
 #### 发送方
 
 ```bash

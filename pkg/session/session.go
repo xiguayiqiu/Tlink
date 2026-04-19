@@ -623,13 +623,27 @@ func (s *Session) executeSystemCommand(cmdStr string) {
 
 	err = cmd.Start()
 	if err != nil {
+		if strings.Contains(fmt.Sprintf("%v", err), "SIGSYS") || strings.Contains(fmt.Sprintf("%v", err), "syscall") {
+			pterm.Warning.Println("Termux 环境不支持系统命令执行")
+			pterm.Info.Println("在 Termux 中请直接使用 send 命令传输文件")
+			fmt.Printf("[tlink]> ")
+			return
+		}
 		pterm.Error.Printf("执行命令失败: %v\n", err)
+		fmt.Printf("[tlink]> ")
 		return
 	}
 
 	err = cmd.Wait()
 	if err != nil {
+		if strings.Contains(fmt.Sprintf("%v", err), "SIGSYS") || strings.Contains(fmt.Sprintf("%v", err), "syscall") {
+			pterm.Warning.Println("Termux 环境不支持系统命令执行")
+			pterm.Info.Println("在 Termux 中请直接使用 send 命令传输文件")
+			fmt.Printf("[tlink]> ")
+			return
+		}
 		pterm.Warning.Printf("命令执行完成，退出代码: %v\n", err)
+		fmt.Printf("[tlink]> ")
 	}
 }
 
