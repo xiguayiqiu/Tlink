@@ -2,6 +2,10 @@
 
 一个简单、高效的文件传输工具，支持局域网传输、远程传输和文件下载功能。
 
+**作者：弈秋忘忧白帽**
+
+**版本：tlink-v0.1**
+
 ## 功能特性
 
 ### 🚀 核心功能
@@ -34,7 +38,7 @@
 ### 安装
 
 ```bash
-git clone https://github.com/yourusername/tlink.git
+git clone https://github.com/xiguayiqiu/Tlink.git
 cd tlink
 go build -o tlink .
 ```
@@ -128,6 +132,16 @@ go build -o tlink .
 
 # 示例
 ./tlink download https://example.com/file.zip
+```
+
+### 查看版本
+
+```bash
+# 查看版本和作者信息
+./tlink --version
+
+# 或使用短参数
+./tlink -v
 ```
 
 ## 命令详解
@@ -259,6 +273,43 @@ INFO  文件大小: 4.50 GB | 线程数: 8
 - **Cobra** - 命令行框架
 - **Pterm** - 终端 UI 组件
 - **Shellexec** - 系统命令集成
+
+## 编译说明
+
+### 使用构建脚本
+
+项目提供了自动化构建脚本，可以一键编译所有平台版本：
+
+```bash
+./build.sh
+```
+
+编译后的文件将生成在 `dist` 目录中。
+
+### 支持的平台
+
+| 文件名 | 平台 | 架构 |
+|------|------|
+| `tlink-linux-amd64` | Linux | x86_64 |
+| `tlink-linux-arm` | Linux | ARMv7 |
+| `tlink-linux-arm64` | Linux | ARM64 (aarch64) |
+| `tlink-termux-arm64` | Termux | ARM64 (aarch64) |
+| `tlink-windows-amd64.exe` | Windows | x86_64 |
+| `tlink-windows-arm64.exe` | Windows | ARM64 |
+
+### 从源码编译
+
+```bash
+# 克隆项目
+git clone https://github.com/xiguayiqiu/Tlink.git
+cd Tlink
+
+# 编译当前平台
+go build -o tlink .
+
+# 查看版本
+./tlink --version
+```
 
 ## 许可证
 
