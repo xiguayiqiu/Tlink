@@ -1,9 +1,11 @@
 package session
 
 import (
+	"archive/zip"
 	"bufio"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"os/signal"
@@ -33,8 +35,9 @@ type Session struct {
 	isTransmitting bool
 	transmitChan   chan *protocol.Message
 	interruptChan  chan os.Signal
-	cancelChan     chan struct{} // 用于取消当前传输
-	initialFile    string        // 启动时自动发送的文件
+	cancelChan     chan struct{}
+	initialFile    string
+	compress       bool
 }
 
 func NewSession(uid, deviceName, saveDir string, conn net.Conn, peerName string, initialFile ...string) *Session {
@@ -52,6 +55,10 @@ func NewSession(uid, deviceName, saveDir string, conn net.Conn, peerName string,
 		s.initialFile = initialFile[0]
 	}
 	return s
+}
+
+func (s *Session) SetCompress(enabled bool) {
+	s.compress = enabled
 }
 
 func (s *Session) Start() {
@@ -198,12 +205,50 @@ func (s *Session) sendFile(filePath string) {
 		return
 	}
 
+	// 处理目录
+	var actualPath string
+	var isCompressed bool
 	if fileInfo.IsDir() {
-		pterm.Error.Println("暂不支持发送目录")
-		return
+		if !s.compress {
+			pterm.Warning.Println("检测到目录，自动启用压缩传输...")
+		}
+		// 压缩目录
+		zipPath := filePath + ".zip"
+		pterm.Info.Printf("正在压缩目录: %s -> %s\n", filePath, zipPath)
+		if err := compressDirectory(filePath, zipPath); err != nil {
+			pterm.Error.Printf("压缩目录失败: %v\n", err)
+			return
+		}
+		defer os.Remove(zipPath) // 传输完后删除临时文件
+		actualPath = zipPath
+		isCompressed = true
+		fileInfo, err = os.Stat(zipPath)
+		if err != nil {
+			pterm.Error.Printf("无法访问压缩文件: %v\n", err)
+			return
+		}
+	} else if s.compress {
+		// 单个文件也压缩
+		zipPath := filePath + ".zip"
+		pterm.Info.Printf("正在压缩文件: %s -> %s\n", filePath, zipPath)
+		if err := compressDirectory(filepath.Dir(filePath), zipPath); err != nil {
+			pterm.Error.Printf("压缩文件失败: %v\n", err)
+			return
+		}
+		defer os.Remove(zipPath)
+		actualPath = zipPath
+		isCompressed = true
+		fileInfo, err = os.Stat(zipPath)
+		if err != nil {
+			pterm.Error.Printf("无法访问压缩文件: %v\n", err)
+			return
+		}
+	} else {
+		actualPath = filePath
+		isCompressed = false
 	}
 
-	file, err := os.Open(filePath)
+	file, err := os.Open(actualPath)
 	if err != nil {
 		pterm.Error.Printf("无法打开文件: %v\n", err)
 		return
@@ -221,6 +266,7 @@ func (s *Session) sendFile(filePath string) {
 		FileSize:     fileInfo.Size(),
 		LastModified: fileInfo.ModTime().Unix(),
 		FileHash:     fileHash,
+		IsCompressed: isCompressed,
 	}
 
 	msg := protocol.NewMessage(protocol.MsgTypeFileMetadata, metadata)
@@ -449,6 +495,7 @@ func (s *Session) handleIncomingFile(initMsg *protocol.Message) {
 	cancelled := false
 	savePath := ""
 	var file *os.File
+	var tempZipPath string
 
 	defer func() {
 		s.isTransmitting = false
@@ -459,6 +506,9 @@ func (s *Session) handleIncomingFile(initMsg *protocol.Message) {
 		// 如果被取消，删除不完整的文件
 		if cancelled && savePath != "" {
 			os.Remove(savePath)
+		}
+		if tempZipPath != "" {
+			os.Remove(tempZipPath)
 		}
 	}()
 
@@ -477,11 +527,21 @@ func (s *Session) handleIncomingFile(initMsg *protocol.Message) {
 	}
 
 	fmt.Println()
-	pterm.Warning.Printf("\n收到文件传输请求: %s (%s)\n", metadata.FileName, protocol.FormatSize(metadata.FileSize))
+	if metadata.IsCompressed {
+		pterm.Warning.Printf("\n收到压缩文件传输请求: %s (%s)\n", metadata.FileName, protocol.FormatSize(metadata.FileSize))
+	} else {
+		pterm.Warning.Printf("\n收到文件传输请求: %s (%s)\n", metadata.FileName, protocol.FormatSize(metadata.FileSize))
+	}
 	pterm.Info.Println("正在接收文件...")
 
-	savePath = filepath.Join(s.saveDir, metadata.FileName)
-	file, err = os.Create(savePath)
+	// 如果是压缩文件，先保存到临时 zip 路径
+	if metadata.IsCompressed {
+		tempZipPath = filepath.Join(s.saveDir, metadata.FileName+".tmp.zip")
+		file, err = os.Create(tempZipPath)
+	} else {
+		savePath = filepath.Join(s.saveDir, metadata.FileName)
+		file, err = os.Create(savePath)
+	}
 	if err != nil {
 		pterm.Error.Printf("\n创建文件失败: %v\n", err)
 		fmt.Printf("[tlink]> ")
@@ -603,7 +663,22 @@ func (s *Session) handleIncomingFile(initMsg *protocol.Message) {
 	}
 
 	pterm.Success.Println("\n文件接收成功！")
-	pterm.Info.Printf("保存到: %s\n", savePath)
+
+	// 如果是压缩文件，进行解压
+	if metadata.IsCompressed {
+		pterm.Info.Println("正在解压文件...")
+		destPath := filepath.Join(s.saveDir, metadata.FileName)
+		if err := unzipArchive(tempZipPath, s.saveDir); err != nil {
+			pterm.Warning.Printf("解压失败: %v，压缩文件已保留: %s\n", err, tempZipPath)
+			tempZipPath = "" // 保留文件
+		} else {
+			pterm.Success.Println("解压成功！")
+		}
+		pterm.Info.Printf("保存到: %s\n", destPath)
+	} else {
+		pterm.Info.Printf("保存到: %s\n", savePath)
+	}
+
 	elapsed := time.Since(startTime)
 	avgSpeed := float64(metadata.FileSize) / elapsed.Seconds()
 	pterm.Info.Printf("耗时: %s, 平均速度: %s/s\n", formatDuration(elapsed), protocol.FormatSize(int64(avgSpeed)))
@@ -697,4 +772,114 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%d分%d秒", m, s)
 	}
 	return fmt.Sprintf("%d秒", s)
+}
+
+func compressDirectory(path string, zipPath string) error {
+	zipFile, err := os.Create(zipPath)
+	if err != nil {
+		return err
+	}
+	defer zipFile.Close()
+
+	w := zip.NewWriter(zipFile)
+	defer w.Close()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	baseDir := filepath.Dir(path) // 默认以 path 是单个文件，用 filepath.Dir(path) 作为基准
+	baseName := filepath.Base(path)
+
+	if info.IsDir() {
+		// 如果是目录，遍历目录内容
+		err = filepath.Walk(path, func(curPath string, curInfo fs.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+
+			relPath, err := filepath.Rel(baseDir, curPath)
+			if err != nil {
+				return err
+			}
+
+			if curInfo.IsDir() {
+				return nil
+			}
+
+			f, err := w.Create(relPath)
+			if err != nil {
+				return err
+			}
+
+			file, err := os.Open(curPath)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+
+			_, err = io.Copy(f, file)
+			return err
+		})
+	} else {
+		// 单个文件
+		f, err := w.Create(baseName)
+		if err != nil {
+			return err
+		}
+
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		_, err = io.Copy(f, file)
+	}
+
+	return err
+}
+
+func unzipArchive(zipPath string, destDir string) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		fpath := filepath.Join(destDir, f.Name)
+
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(fpath, f.Mode()); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+			return err
+		}
+
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			return err
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			outFile.Close()
+			return err
+		}
+
+		_, err = io.Copy(outFile, rc)
+		outFile.Close()
+		rc.Close()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

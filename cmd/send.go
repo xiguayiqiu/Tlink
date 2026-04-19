@@ -18,11 +18,11 @@ import (
 )
 
 var sendRemoteIP string
-
+var sendCompress bool
 var sendCmd = &cobra.Command{
 	Use:     "send",
 	Short:   "启动监听或连接",
-	Long:    `启动监听等待连接；使用 -R <端口> 监听指定端口，或使用 -R <ip:port> 连接到对方`,
+	Long:    `启动监听等待连接；使用 -R <端口> 监听指定端口，或使用 -R <ip:port> 连接到对方；使用 -z 自动压缩打包目录`,
 	Aliases: []string{"s"},
 	Args:    cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -243,11 +243,13 @@ var sendCmd = &cobra.Command{
 
 			peerName := connectData.DeviceName
 			sess := session.NewSession(uid, deviceName, saveDir, conn, peerName, initialFile)
+			sess.SetCompress(sendCompress)
 			sess.Start()
 			return
 		}
 
 		sess := session.NewSession(uid, deviceName, saveDir, conn, peerName, initialFile)
+		sess.SetCompress(sendCompress)
 		sess.Start()
 	},
 }
@@ -290,5 +292,6 @@ func readMessage(conn net.Conn) (*protocol.Message, error) {
 
 func init() {
 	sendCmd.Flags().StringVarP(&sendRemoteIP, "remote", "R", "", "指定监听端口（例如 9876）或连接地址（例如 192.168.1.100:9876）")
+	sendCmd.Flags().BoolVarP(&sendCompress, "compress", "z", false, "自动压缩打包目录传输")
 	rootCmd.AddCommand(sendCmd)
 }

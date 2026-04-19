@@ -39,6 +39,7 @@ type FileMetadataData struct {
 	FileSize     int64  `json:"file_size"`
 	LastModified int64  `json:"last_modified"`
 	FileHash     string `json:"file_hash,omitempty"`
+	IsCompressed bool   `json:"is_compressed,omitempty"`
 }
 
 type FileChunkData struct {
