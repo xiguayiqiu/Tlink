@@ -11,7 +11,6 @@ import (
 	"tlink/pkg/discovery"
 	"tlink/pkg/protocol"
 	"tlink/pkg/session"
-	"tlink/pkg/transfer"
 
 	"github.com/google/uuid"
 	"github.com/pterm/pterm"
@@ -42,6 +41,12 @@ var sendCmd = &cobra.Command{
 					saveDir = receiveOutputPath
 				}
 			}
+		}
+
+		// 保存初始文件路径
+		var initialFile string
+		if len(args) > 0 {
+			initialFile = args[0]
 		}
 
 		var conn net.Conn
@@ -159,15 +164,14 @@ var sendCmd = &cobra.Command{
 				}
 			}
 		} else {
-			sender := transfer.NewSender(uid, deviceName, "")
-			defer sender.Close()
-
-			var err error
-			tcpPort, err := sender.Listen()
+			listener, err := net.Listen("tcp", ":0")
 			if err != nil {
 				pterm.Error.Printf("无法监听端口: %v\n", err)
 				os.Exit(1)
 			}
+			defer listener.Close()
+
+			tcpPort := listener.Addr().(*net.TCPAddr).Port
 
 			var fileName string
 			var fileSize int64
@@ -192,9 +196,25 @@ var sendCmd = &cobra.Command{
 			}
 			pterm.Println()
 
-			connectData, err := sender.Accept()
+			conn, err := listener.Accept()
 			if err != nil {
 				pterm.Error.Printf("接受连接失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			msg, err := readMessage(conn)
+			if err != nil {
+				pterm.Error.Printf("读取连接消息失败: %v\n", err)
+				os.Exit(1)
+			}
+			if msg.Type != protocol.MsgTypeConnect {
+				pterm.Error.Printf("收到意外消息: %s\n", msg.Type)
+				os.Exit(1)
+			}
+
+			connectData, err := protocol.ParseConnectData(msg.Data)
+			if err != nil {
+				pterm.Error.Printf("解析连接消息失败: %v\n", err)
 				os.Exit(1)
 			}
 
@@ -211,16 +231,23 @@ var sendCmd = &cobra.Command{
 				return
 			}
 
-			if err := sender.AcceptConnection(); err != nil {
+			ackData := protocol.ConnectData{
+				UID:        uid,
+				DeviceName: deviceName,
+			}
+			ackMsg := protocol.NewMessage(protocol.MsgTypeAccept, ackData)
+			if err := sendMessage(conn, ackMsg); err != nil {
 				pterm.Error.Printf("发送接受消息失败: %v\n", err)
 				os.Exit(1)
 			}
 
-			pterm.Warning.Println("局域网模式下暂不支持交互式会话")
+			peerName := connectData.DeviceName
+			sess := session.NewSession(uid, deviceName, saveDir, conn, peerName, initialFile)
+			sess.Start()
 			return
 		}
 
-		sess := session.NewSession(uid, deviceName, saveDir, conn, peerName)
+		sess := session.NewSession(uid, deviceName, saveDir, conn, peerName, initialFile)
 		sess.Start()
 	},
 }

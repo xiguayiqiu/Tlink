@@ -263,8 +263,41 @@ func promptSelectPeer(peers []*discovery.PeerInfo) *discovery.PeerInfo {
 }
 
 func connectAndReceive(uid, deviceName string, peer *discovery.PeerInfo, saveDir string) {
-	pterm.Warning.Println("局域网模式下暂不支持交互式会话")
-	return
+	pterm.Info.Printf("正在连接到 %s:%d...\n", peer.Address.IP.String(), peer.TCPPort)
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", peer.Address.IP.String(), peer.TCPPort), 30*time.Second)
+	if err != nil {
+		pterm.Error.Printf("连接失败: %v\n", err)
+		return
+	}
+
+	connectData := protocol.ConnectData{
+		UID:        uid,
+		DeviceName: deviceName,
+	}
+	msg := protocol.NewMessage(protocol.MsgTypeConnect, connectData)
+	if err := sendMessage(conn, msg); err != nil {
+		pterm.Error.Printf("发送连接消息失败: %v\n", err)
+		return
+	}
+
+	ackMsg, err := readMessage(conn)
+	if err != nil {
+		pterm.Error.Printf("等待接受失败: %v\n", err)
+		return
+	}
+	if ackMsg.Type != protocol.MsgTypeAccept {
+		pterm.Error.Printf("连接被拒绝: %s\n", ackMsg.Type)
+		return
+	}
+
+	peerConnectData, _ := protocol.ParseConnectData(ackMsg.Data)
+	peerName := "未知设备"
+	if peerConnectData != nil {
+		peerName = peerConnectData.DeviceName
+	}
+
+	sess := session.NewSession(uid, deviceName, saveDir, conn, peerName)
+	sess.Start()
 }
 
 func formatDuration(d time.Duration) string {

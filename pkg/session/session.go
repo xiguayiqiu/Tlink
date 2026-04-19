@@ -34,10 +34,11 @@ type Session struct {
 	transmitChan   chan *protocol.Message
 	interruptChan  chan os.Signal
 	cancelChan     chan struct{} // 用于取消当前传输
+	initialFile    string        // 启动时自动发送的文件
 }
 
-func NewSession(uid, deviceName, saveDir string, conn net.Conn, peerName string) *Session {
-	return &Session{
+func NewSession(uid, deviceName, saveDir string, conn net.Conn, peerName string, initialFile ...string) *Session {
+	s := &Session{
 		uid:           uid,
 		deviceName:    deviceName,
 		conn:          conn,
@@ -47,6 +48,10 @@ func NewSession(uid, deviceName, saveDir string, conn net.Conn, peerName string)
 		transmitChan:  make(chan *protocol.Message, 10),
 		interruptChan: make(chan os.Signal, 1),
 	}
+	if len(initialFile) > 0 {
+		s.initialFile = initialFile[0]
+	}
+	return s
 }
 
 func (s *Session) Start() {
@@ -86,6 +91,12 @@ func (s *Session) Start() {
 
 	// 启动消息接收 goroutine
 	go s.receiveMessages()
+
+	// 如果有初始文件，先自动发送
+	if s.initialFile != "" {
+		pterm.Info.Printf("正在自动发送文件: %s\n", s.initialFile)
+		s.sendFile(s.initialFile)
+	}
 
 	// 启动交互式命令行
 	s.runInteractive()
