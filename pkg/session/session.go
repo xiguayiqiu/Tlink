@@ -8,13 +8,15 @@ import (
 	"io/fs"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/mibk/shellexec"
+	"github.com/chzyer/readline"
 	"github.com/pterm/pterm"
 
 	"tlink/pkg/protocol"
@@ -110,6 +112,84 @@ func (s *Session) Start() {
 }
 
 func (s *Session) runInteractive() {
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:          "[tlink]> ",
+		HistoryFile:     filepath.Join(os.TempDir(), "tlink_history"),
+		InterruptPrompt: "^C",
+		EOFPrompt:       "exit",
+	})
+	if err != nil {
+		// 如果 readline 初始化失败，回退到简单的 bufio
+		s.runInteractiveFallback()
+		return
+	}
+	defer rl.Close()
+
+	// 启动 goroutine 检查 stopChan
+	stopReadChan := make(chan struct{})
+	go func() {
+		select {
+		case <-s.stopChan:
+			rl.Clean()
+			close(stopReadChan)
+		}
+	}()
+
+	for {
+		select {
+		case <-stopReadChan:
+			fmt.Println()
+			pterm.Warning.Println("连接已断开！")
+			return
+		default:
+			input, err := rl.Readline()
+			if err != nil {
+				if err == readline.ErrInterrupt {
+					// Ctrl+C 只是中断当前，不退出
+					continue
+				}
+				if err == io.EOF {
+					pterm.Info.Println("正在退出...")
+					close(s.stopChan)
+					return
+				}
+				pterm.Error.Printf("读取命令失败: %v\n", err)
+				continue
+			}
+
+			input = strings.TrimSpace(input)
+			if input == "" {
+				continue
+			}
+
+			// 添加到历史记录
+			rl.SaveHistory(input)
+
+			parts := strings.Fields(input)
+			cmd := strings.ToLower(parts[0])
+
+			switch cmd {
+			case "help", "--help":
+				s.printHelp()
+			case "exit", "quit":
+				pterm.Info.Println("正在退出...")
+				close(s.stopChan)
+				return
+			case "send":
+				if len(parts) < 2 {
+					pterm.Error.Println("用法: send <文件路径>")
+					continue
+				}
+				filePath := parts[1]
+				s.sendFile(filePath)
+			default:
+				s.executeSystemCommand(input)
+			}
+		}
+	}
+}
+
+func (s *Session) runInteractiveFallback() {
 	reader := bufio.NewReader(os.Stdin)
 
 	for {
@@ -186,6 +266,9 @@ func (s *Session) sendFile(filePath string) {
 		return
 	}
 
+	// 清理路径：移除末尾的斜杠
+	filePath = filepath.Clean(filePath)
+
 	// 清空传输通道中的旧消息
 	s.clearTransmitChan()
 
@@ -231,7 +314,7 @@ func (s *Session) sendFile(filePath string) {
 		// 单个文件也压缩
 		zipPath := filePath + ".zip"
 		pterm.Info.Printf("正在压缩文件: %s -> %s\n", filePath, zipPath)
-		if err := compressDirectory(filepath.Dir(filePath), zipPath); err != nil {
+		if err := compressDirectory(filePath, zipPath); err != nil {
 			pterm.Error.Printf("压缩文件失败: %v\n", err)
 			return
 		}
@@ -435,6 +518,8 @@ func (s *Session) receiveMessages() {
 					}
 				case protocol.MsgTypeCancelTransfer:
 					// 收到取消传输但没有正在传输，忽略
+				case protocol.MsgTypeTransferComplete:
+					// 收到完成但没有正在传输，忽略（可能是旧消息）
 				default:
 					pterm.Warning.Printf("\n收到未知消息类型: %s\n", msg.Type)
 					fmt.Printf("[tlink]> ")
@@ -493,7 +578,8 @@ func (s *Session) handleIncomingFile(initMsg *protocol.Message) {
 	s.cancelChan = make(chan struct{})
 
 	cancelled := false
-	savePath := ""
+	savePath := ""     // 最终保存路径
+	tempSavePath := "" // 临时接收路径
 	var file *os.File
 	var tempZipPath string
 
@@ -504,8 +590,8 @@ func (s *Session) handleIncomingFile(initMsg *protocol.Message) {
 			file.Close()
 		}
 		// 如果被取消，删除不完整的文件
-		if cancelled && savePath != "" {
-			os.Remove(savePath)
+		if cancelled && tempSavePath != "" {
+			os.Remove(tempSavePath)
 		}
 		if tempZipPath != "" {
 			os.Remove(tempZipPath)
@@ -534,13 +620,14 @@ func (s *Session) handleIncomingFile(initMsg *protocol.Message) {
 	}
 	pterm.Info.Println("正在接收文件...")
 
-	// 如果是压缩文件，先保存到临时 zip 路径
+	savePath = filepath.Join(s.saveDir, metadata.FileName)
+	// 全部先保存到 .tmp 临时文件，传输完成后再重命名，避免 Windows 文件占用问题
 	if metadata.IsCompressed {
 		tempZipPath = filepath.Join(s.saveDir, metadata.FileName+".tmp.zip")
 		file, err = os.Create(tempZipPath)
 	} else {
-		savePath = filepath.Join(s.saveDir, metadata.FileName)
-		file, err = os.Create(savePath)
+		tempSavePath = filepath.Join(s.saveDir, metadata.FileName+".tmp")
+		file, err = os.Create(tempSavePath)
 	}
 	if err != nil {
 		pterm.Error.Printf("\n创建文件失败: %v\n", err)
@@ -650,15 +737,46 @@ func (s *Session) handleIncomingFile(initMsg *protocol.Message) {
 		return
 	}
 
-	file.Seek(0, 0)
-	if metadata.FileHash != "" {
-		computedFileHash, err := transfer.ComputeFileHash(file)
-		if err != nil {
-			pterm.Warning.Printf("\n无法计算文件哈希: %v\n", err)
-		} else if computedFileHash == metadata.FileHash {
-			pterm.Success.Println("\n✓ 文件完整性验证成功")
+	// 计算哈希前先关闭文件，因为 Windows 上正在打开的文件可能有问题
+	file.Close()
+	file = nil
+
+	// 如果不是压缩文件，先重命名临时文件到正式文件名
+	var hashFile *os.File
+	if !metadata.IsCompressed {
+		// 重命名临时文件
+		if err := os.Rename(tempSavePath, savePath); err != nil {
+			// 如果重命名失败（比如 Windows 上目标文件正在运行），给用户提示
+			pterm.Warning.Printf("\n无法覆盖目标文件（可能正在使用中）: %v\n临时文件已保存: %s\n", err, tempSavePath)
 		} else {
-			pterm.Error.Println("\n✗ 文件完整性验证失败")
+			// 重命名成功，清理 tempSavePath
+			tempSavePath = ""
+		}
+		// 打开正式文件计算哈希
+		if tempSavePath == "" {
+			hashFile, err = os.Open(savePath)
+		} else {
+			hashFile, err = os.Open(tempSavePath)
+		}
+	} else {
+		// 压缩文件的话，使用临时 zip 文件计算哈希
+		hashFile, err = os.Open(tempZipPath)
+	}
+	if err != nil {
+		pterm.Warning.Printf("\n无法打开文件计算哈希: %v\n", err)
+	} else {
+		if metadata.FileHash != "" {
+			computedFileHash, err := transfer.ComputeFileHash(hashFile)
+			hashFile.Close()
+			if err != nil {
+				pterm.Warning.Printf("\n无法计算文件哈希: %v\n", err)
+			} else if computedFileHash == metadata.FileHash {
+				pterm.Success.Println("\n✓ 文件完整性验证成功")
+			} else {
+				pterm.Error.Println("\n✗ 文件完整性验证失败")
+			}
+		} else {
+			hashFile.Close()
 		}
 	}
 
@@ -670,55 +788,86 @@ func (s *Session) handleIncomingFile(initMsg *protocol.Message) {
 		destPath := filepath.Join(s.saveDir, metadata.FileName)
 		if err := unzipArchive(tempZipPath, s.saveDir); err != nil {
 			pterm.Warning.Printf("解压失败: %v，压缩文件已保留: %s\n", err, tempZipPath)
-			tempZipPath = "" // 保留文件
+			// 不设置 tempZipPath = ""，保留文件不删除
 		} else {
 			pterm.Success.Println("解压成功！")
+			// 解压成功后删除临时 zip
+			if tempZipPath != "" {
+				os.Remove(tempZipPath)
+			}
 		}
-		pterm.Info.Printf("保存到: %s\n", destPath)
+		if _, err := os.Stat(tempZipPath); os.IsNotExist(err) {
+			pterm.Info.Printf("保存到: %s\n", destPath)
+		} else {
+			pterm.Info.Printf("压缩文件已保留: %s\n", tempZipPath)
+		}
 	} else {
-		pterm.Info.Printf("保存到: %s\n", savePath)
+		if tempSavePath == "" {
+			pterm.Info.Printf("保存到: %s\n", savePath)
+		} else {
+			pterm.Info.Printf("临时保存到: %s\n请手动重命名为: %s\n", tempSavePath, savePath)
+		}
 	}
 
 	elapsed := time.Since(startTime)
 	avgSpeed := float64(metadata.FileSize) / elapsed.Seconds()
 	pterm.Info.Printf("耗时: %s, 平均速度: %s/s\n", formatDuration(elapsed), protocol.FormatSize(int64(avgSpeed)))
 	fmt.Printf("[tlink]> ")
+
+	// 清空传输通道中的剩余消息，防止后续警告
+	s.clearTransmitChan()
 }
 
 func (s *Session) executeSystemCommand(cmdStr string) {
-	cmd, err := shellexec.Command(cmdStr)
-	if err != nil {
-		pterm.Error.Printf("解析命令失败: %v\n", err)
-		return
+	var cmd *exec.Cmd
+
+	// 尝试使用标准库 exec，而不是依赖 shellexec
+	// 根据不同操作系统选择 shell
+	if runtime.GOOS == "windows" {
+		// Windows 上使用 cmd.exe
+		cmd = exec.Command("cmd.exe", "/c", cmdStr)
+	} else {
+		// Linux/macOS 上使用 bash
+		cmd = exec.Command("bash", "-c", cmdStr)
 	}
 
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	err = cmd.Start()
+	err := cmd.Start()
 	if err != nil {
-		if strings.Contains(fmt.Sprintf("%v", err), "SIGSYS") || strings.Contains(fmt.Sprintf("%v", err), "syscall") {
+		// 检测特殊错误
+		errStr := fmt.Sprintf("%v", err)
+		if strings.Contains(errStr, "SIGSYS") || strings.Contains(errStr, "syscall") {
 			pterm.Warning.Println("Termux 环境不支持系统命令执行")
 			pterm.Info.Println("在 Termux 中请直接使用 send 命令传输文件")
-			fmt.Printf("[tlink]> ")
+			return
+		}
+		if runtime.GOOS == "windows" {
+			pterm.Warning.Println("Windows 上系统命令执行受限")
+			pterm.Info.Println("建议直接使用 send 命令传输文件")
 			return
 		}
 		pterm.Error.Printf("执行命令失败: %v\n", err)
-		fmt.Printf("[tlink]> ")
 		return
 	}
 
 	err = cmd.Wait()
 	if err != nil {
-		if strings.Contains(fmt.Sprintf("%v", err), "SIGSYS") || strings.Contains(fmt.Sprintf("%v", err), "syscall") {
+		errStr := fmt.Sprintf("%v", err)
+		if strings.Contains(errStr, "SIGSYS") || strings.Contains(errStr, "syscall") {
 			pterm.Warning.Println("Termux 环境不支持系统命令执行")
 			pterm.Info.Println("在 Termux 中请直接使用 send 命令传输文件")
-			fmt.Printf("[tlink]> ")
 			return
 		}
-		pterm.Warning.Printf("命令执行完成，退出代码: %v\n", err)
-		fmt.Printf("[tlink]> ")
+		// 在 Windows 上，如果退出代码非 0，可能是命令不存在
+		if runtime.GOOS == "windows" && strings.Contains(errStr, "exit status") {
+			// 安静地忽略
+		} else {
+			pterm.Warning.Printf("命令执行完成，退出代码: %v\n", err)
+		}
+		return
 	}
 }
 
@@ -789,26 +938,35 @@ func compressDirectory(path string, zipPath string) error {
 		return err
 	}
 
-	baseDir := filepath.Dir(path) // 默认以 path 是单个文件，用 filepath.Dir(path) 作为基准
 	baseName := filepath.Base(path)
 
 	if info.IsDir() {
-		// 如果是目录，遍历目录内容
+		// 如果是目录，遍历目录内容，相对于当前目录
 		err = filepath.Walk(path, func(curPath string, curInfo fs.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
 
-			relPath, err := filepath.Rel(baseDir, curPath)
+			relPath, err := filepath.Rel(path, curPath)
 			if err != nil {
 				return err
 			}
 
+			// 构建在 zip 中的路径：baseName/relPath
+			zipEntryPath := filepath.Join(baseName, relPath)
+
 			if curInfo.IsDir() {
+				// 创建目录条目，使用 / 作为路径分隔符（zip 标准）
+				zipEntryPath = strings.ReplaceAll(zipEntryPath, "\\", "/") + "/"
+				if _, err := w.Create(zipEntryPath); err != nil {
+					return err
+				}
 				return nil
 			}
 
-			f, err := w.Create(relPath)
+			// 创建文件条目，使用 / 作为路径分隔符
+			zipEntryPath = strings.ReplaceAll(zipEntryPath, "\\", "/")
+			f, err := w.Create(zipEntryPath)
 			if err != nil {
 				return err
 			}
@@ -824,7 +982,8 @@ func compressDirectory(path string, zipPath string) error {
 		})
 	} else {
 		// 单个文件
-		f, err := w.Create(baseName)
+		zipEntryPath := strings.ReplaceAll(baseName, "\\", "/")
+		f, err := w.Create(zipEntryPath)
 		if err != nil {
 			return err
 		}
@@ -848,36 +1007,78 @@ func unzipArchive(zipPath string, destDir string) error {
 	}
 	defer r.Close()
 
+	var failedFiles []string // 记录解压失败的文件
+
 	for _, f := range r.File {
-		fpath := filepath.Join(destDir, f.Name)
+		// 清理 zip 中的路径，将 / 转换为当前系统的分隔符
+		cleanName := filepath.Clean(f.Name)
+		// 防止路径穿越（如 ../）
+		if strings.HasPrefix(cleanName, "..") || strings.HasPrefix(cleanName, string(os.PathSeparator)) {
+			failedFiles = append(failedFiles, f.Name+": 不安全的路径")
+			continue
+		}
+
+		fpath := filepath.Join(destDir, cleanName)
 
 		if f.FileInfo().IsDir() {
-			if err := os.MkdirAll(fpath, f.Mode()); err != nil {
-				return err
+			if err := os.MkdirAll(fpath, 0755); err != nil {
+				failedFiles = append(failedFiles, f.Name+": "+err.Error())
+				continue
 			}
 			continue
 		}
 
-		if err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
-			return err
+		if err := os.MkdirAll(filepath.Dir(fpath), 0755); err != nil {
+			failedFiles = append(failedFiles, f.Name+": "+err.Error())
+			continue
 		}
 
-		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		// 先写到临时文件，用足够的权限创建
+		tempPath := fpath + ".tmp"
+		outFile, err := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 		if err != nil {
-			return err
+			failedFiles = append(failedFiles, f.Name+": "+err.Error())
+			continue
 		}
 
 		rc, err := f.Open()
 		if err != nil {
 			outFile.Close()
-			return err
+			os.Remove(tempPath)
+			failedFiles = append(failedFiles, f.Name+": "+err.Error())
+			continue
 		}
 
 		_, err = io.Copy(outFile, rc)
 		outFile.Close()
 		rc.Close()
+
 		if err != nil {
-			return err
+			os.Remove(tempPath)
+			failedFiles = append(failedFiles, f.Name+": "+err.Error())
+			continue
+		}
+
+		// 尝试重命名临时文件到正式文件
+		if err := os.Rename(tempPath, fpath); err != nil {
+			// 重命名失败，保留临时文件
+			failedFiles = append(failedFiles, f.Name+": "+err.Error()+" (已保存为 "+tempPath+")")
+			continue
+		}
+
+		// 设置文件权限（如果有）
+		if f.Mode() != 0 {
+			if err := os.Chmod(fpath, f.Mode()); err != nil {
+				// 权限设置失败不影响文件本身
+				// 仅记录警告，不加入失败列表
+			}
+		}
+	}
+
+	if len(failedFiles) > 0 {
+		pterm.Warning.Printf("部分文件解压失败:\n")
+		for _, fail := range failedFiles {
+			fmt.Printf("  - %s\n", fail)
 		}
 	}
 
