@@ -14,7 +14,7 @@ var rootCmd = &cobra.Command{
 	Long: `Tlink 是一个以文件传输下载为主要功能的工具：
 - 文件下载（多线程、断点续传）
 - 局域网文件传输`,
-	Version: "版本: tlink-v0.1",
+	Version: "版本: tlink-v0.2",
 }
 
 func init() {
