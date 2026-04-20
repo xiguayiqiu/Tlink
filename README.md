@@ -291,7 +291,7 @@ INFO  文件大小: 4.50 GB | 线程数: 8
 ### 支持的平台
 
 | 文件名 | 平台 | 架构 |
-|------|------|
+|------|------|------|
 | `tlink-linux-amd64` | Linux | x86_64 |
 | `tlink-linux-arm` | Linux | ARMv7 |
 | `tlink-linux-arm64` | Linux | ARM64 (aarch64) |
